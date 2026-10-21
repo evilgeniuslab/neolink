@@ -129,42 +129,26 @@ impl BcCamera {
         let block_size = talk_config.audio_config.length_per_encoder / 2;
         let sample_rate = talk_config.audio_config.sample_rate;
 
-        let msg = Bc {
-            meta: BcMeta {
-                msg_id: MSG_ID_TALKCONFIG,
-                channel_id: self.channel_id,
-                msg_num,
-                stream_type: 0,
-                response_code: 0,
-                class: 0x6414,
-            },
-            body: BcBody::ModernMsg(ModernMsg {
-                extension: Some(Extension {
-                    channel_id: Some(self.channel_id),
-                    ..Default::default()
-                }),
-                payload: Some(BcPayloads::BcXml(BcXml {
-                    talk_config: Some(talk_config),
-                    ..Default::default()
-                })),
-            }),
-        };
-
-        sub.send(msg).await?;
+        sub.send(talk_config_request(
+            self.channel_id,
+            msg_num,
+            talk_config.clone(),
+        ))
+        .await?;
         let mut msg = sub.recv().await?;
 
         // If another client is already talking OR if we crashed before sending
         // msgid 11 the camera will reply 422
         //
-        // The official client in this case just sends msgid 11 and retries so
-        // we will do that too
-        if let BcMeta {
-            response_code: 422, ..
-        } = msg.meta
-        {
+        // The official client in this case sends msgid 11 and then sends the
+        // same TalkConfig request again, so we do that too. The retry must be
+        // the request: resending `msg` here would echo the camera's own 422
+        // reply back to it.
+        if talk_config_needs_retry(&msg) {
+            log::info!("TalkConfig refused with 422, sending TalkReset and retrying once");
             self.talk_stop().await?;
-            // Retry
-            sub.send(msg).await?;
+            sub.send(talk_config_request(self.channel_id, msg_num, talk_config))
+                .await?;
             msg = sub.recv().await?;
         }
 
@@ -173,6 +157,10 @@ impl BcCamera {
         } = msg.meta
         {
         } else {
+            log::warn!(
+                "TalkConfig refused with response code {}",
+                msg.meta.response_code
+            );
             return Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
                 why:
@@ -270,42 +258,26 @@ impl BcCamera {
         let block_size = talk_config.audio_config.length_per_encoder / 2;
         let sample_rate = talk_config.audio_config.sample_rate;
 
-        let msg = Bc {
-            meta: BcMeta {
-                msg_id: MSG_ID_TALKCONFIG,
-                channel_id: self.channel_id,
-                msg_num,
-                stream_type: 0,
-                response_code: 0,
-                class: 0x6414,
-            },
-            body: BcBody::ModernMsg(ModernMsg {
-                extension: Some(Extension {
-                    channel_id: Some(self.channel_id),
-                    ..Default::default()
-                }),
-                payload: Some(BcPayloads::BcXml(BcXml {
-                    talk_config: Some(talk_config),
-                    ..Default::default()
-                })),
-            }),
-        };
-
-        sub.send(msg).await?;
+        sub.send(talk_config_request(
+            self.channel_id,
+            msg_num,
+            talk_config.clone(),
+        ))
+        .await?;
         let mut msg = sub.recv().await?;
 
         // If another client is already talking OR if we crashed before sending
         // msgid 11 the camera will reply 422
         //
-        // The official client in this case just sends msgid 11 and retries so
-        // we will do that too
-        if let BcMeta {
-            response_code: 422, ..
-        } = msg.meta
-        {
+        // The official client in this case sends msgid 11 and then sends the
+        // same TalkConfig request again, so we do that too. The retry must be
+        // the request: resending `msg` here would echo the camera's own 422
+        // reply back to it.
+        if talk_config_needs_retry(&msg) {
+            log::info!("TalkConfig refused with 422, sending TalkReset and retrying once");
             self.talk_stop().await?;
-            // Retry
-            sub.send(msg).await?;
+            sub.send(talk_config_request(self.channel_id, msg_num, talk_config))
+                .await?;
             msg = sub.recv().await?;
         }
 
@@ -314,6 +286,10 @@ impl BcCamera {
         } = msg.meta
         {
         } else {
+            log::warn!(
+                "TalkConfig refused with response code {}",
+                msg.meta.response_code
+            );
             return Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
                 why:
@@ -464,6 +440,36 @@ impl BcCamera {
     }
 }
 
+/// The TalkConfig (msgid 201) request that opens a talk session.
+fn talk_config_request(channel_id: u8, msg_num: u16, talk_config: TalkConfig) -> Bc {
+    Bc {
+        meta: BcMeta {
+            msg_id: MSG_ID_TALKCONFIG,
+            channel_id,
+            msg_num,
+            stream_type: 0,
+            response_code: 0,
+            class: 0x6414,
+        },
+        body: BcBody::ModernMsg(ModernMsg {
+            extension: Some(Extension {
+                channel_id: Some(channel_id),
+                ..Default::default()
+            }),
+            payload: Some(BcPayloads::BcXml(BcXml {
+                talk_config: Some(talk_config),
+                ..Default::default()
+            })),
+        }),
+    }
+}
+
+/// A 422 reply to TalkConfig means the camera still holds an earlier talk
+/// session: send TalkReset (msgid 11) and then the same request once more.
+fn talk_config_needs_retry(reply: &Bc) -> bool {
+    reply.meta.msg_id == MSG_ID_TALKCONFIG && reply.meta.response_code == 422
+}
+
 struct BufferedStream {
     rx: Receiver<Vec<u8>>,
     buffer: Vec<u8>,
@@ -523,5 +529,65 @@ impl BufRead for BufferedStream {
     fn consume(&mut self, amt: usize) {
         assert!(self.consumed + amt <= self.buffer.len());
         self.consumed += amt;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn talk_config_reply(response_code: u16) -> Bc {
+        Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_TALKCONFIG,
+                channel_id: 0,
+                msg_num: 7,
+                stream_type: 0,
+                response_code,
+                class: 0x0000,
+            },
+            body: BcBody::ModernMsg(ModernMsg::default()),
+        }
+    }
+
+    #[test]
+    fn talk_config_retries_only_on_422() {
+        assert!(talk_config_needs_retry(&talk_config_reply(422)));
+        assert!(!talk_config_needs_retry(&talk_config_reply(200)));
+        assert!(!talk_config_needs_retry(&talk_config_reply(400)));
+    }
+
+    #[test]
+    fn talk_config_retry_is_the_request_not_the_reply() {
+        let config = TalkConfig {
+            channel_id: 0,
+            duplex: "FDX".to_string(),
+            audio_stream_mode: "followVideoStream".to_string(),
+            audio_config: AudioConfig {
+                audio_type: "adpcm".to_string(),
+                sample_rate: 16000,
+                length_per_encoder: 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = talk_config_request(0, 7, config.clone());
+        let retry = talk_config_request(0, 7, config.clone());
+
+        assert_eq!(first, retry);
+        assert_ne!(retry, talk_config_reply(422));
+        assert_eq!(retry.meta.response_code, 0);
+        assert_eq!(retry.meta.msg_id, MSG_ID_TALKCONFIG);
+        match retry.body {
+            BcBody::ModernMsg(ModernMsg {
+                payload:
+                    Some(BcPayloads::BcXml(BcXml {
+                        talk_config: Some(sent),
+                        ..
+                    })),
+                ..
+            }) => assert_eq!(sent, config),
+            other => panic!("retry carries no TalkConfig: {other:?}"),
+        }
     }
 }
